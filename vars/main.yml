@@ -1,0 +1,5 @@
+---
+openio_mover_agent_sysconfig_dir: "/etc/oio/sds/{{ openio_mover_agent_namespace }}"
+openio_mover_agent_servicename: "oio-mover-agent-{{ openio_mover_agent_serviceid }}"
+openio_mover_agent_type: mover-agent
+...

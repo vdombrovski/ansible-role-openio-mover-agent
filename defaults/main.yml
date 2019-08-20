@@ -1,0 +1,23 @@
+# roles/mover_agent/defaults/main.yml
+---
+openio_mover_agent_namespace: "{{ namespace | default('OPENIO') }}"
+openio_mover_agent_serviceid: "{{ 0 + openio_legacy_serviceid | d(0) | int }}"
+
+openio_mover_agent_gridinit_dir: "/etc/gridinit.d/{{ openio_mover_agent_namespace }}"
+openio_mover_agent_gridinit_prefix: ""
+
+openio_mover_agent_provision_only: false
+
+openio_mover_agent_bind_interface: "{{ ansible_default_ipv4.alias }}"
+openio_mover_agent_bind_address: "{{ openio_bind_address \
+  | default(hostvars[inventory_hostname]['ansible_' + openio_mover_agent_bind_interface]['ipv4']['address']) }}"
+openio_mover_agent_bind_port: 6799
+
+openio_mover_agent_location: "{{ openio_location_room | default ('') }}{{ openio_location_rack | default ('') }}\
+  {{ openio_location_server | default (ansible_hostname ~ '.') }}{{ openio_mover_agent_serviceid }}"
+
+openio_mover_agent_slots:
+  "{{ [ openio_mover_agent_type, openio_mover_agent_type ~ '-' ~ openio_mover_agent_location.split('.')[:-2] | join('-') ] \
+  if openio_mover_agent_location.split('.') | length > 2 \
+  else [ openio_mover_agent_type ] }}"
+...

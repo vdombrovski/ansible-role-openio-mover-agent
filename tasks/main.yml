@@ -1,0 +1,56 @@
+# roles/mover_agent/tasks/main.yml
+---
+- name: "Include {{ ansible_distribution }} variables"
+  include_vars: "{{ item }}"
+  with_first_found:
+    - "{{ ansible_distribution }}.yml"
+    - "{{ ansible_os_family }}.yml"
+  tags: install
+
+- name: "Include {{ ansible_distribution }} tasks"
+  include_tasks: "{{ item }}"
+  with_first_found:
+    - "{{ ansible_distribution }}.yml"
+    - "{{ ansible_os_family }}.yml"
+  tags: install
+
+- name: Ensure directories exists
+  file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('openio') }}"
+    group: "{{ item.group | default('openio') }}"
+    mode: "{{ item.mode | default(0755) }}"
+  with_items:
+    - path: "/etc/gridinit.d/{{ openio_mover_agent_namespace }}"
+    - path: "{{ openio_mover_agent_sysconfig_dir }}/{{ openio_mover_agent_serviceid }}"
+    - path: "/etc/oio/sds/{{ openio_mover_agent_namespace }}/watch"
+    - path: "/var/log/oio/sds/{{ openio_mover_agent_namespace }}/{{ openio_mover_agent_serviceid }}"
+      owner: "{{ syslog_user }}"
+      mode: "0750"
+  tags: install
+
+- name: Generate configuration files
+  template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: openio
+    group: openio
+    mode: 0644
+  with_items:
+    - src: "gridinit_mover_agent.conf.j2"
+      dest: "{{ openio_mover_agent_gridinit_dir }}/{{ openio_mover_agent_gridinit_prefix }}\
+        {{ openio_mover_agent_servicename }}.conf"
+    - src: "watch-mover-agent.yml.j2"
+      dest: "{{ openio_mover_agent_sysconfig_dir }}/watch/{{ openio_mover_agent_servicename }}.yml"
+  register: _mover_agent_conf
+
+- name: restart mover agent
+  shell: |
+    gridinit_cmd reload
+    gridinit_cmd restart  {{ openio_mover_agent_namespace }}-{{ openio_mover_agent_servicename }}
+  when:
+    - _mover_agent_conf.changed
+    - not openio_mover_agent_provision_only
+  tags: configure
+...

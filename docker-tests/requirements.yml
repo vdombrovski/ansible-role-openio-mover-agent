@@ -1,0 +1,17 @@
+---
+- src: https://github.com/open-io/ansible-role-openio-users.git
+  version: "18.10"
+  name: users
+
+- src: https://github.com/open-io/ansible-role-openio-namespace.git
+  version: "18.10"
+  name: namespace
+
+- src: https://github.com/open-io/ansible-role-openio-gridinit.git
+  version: "18.10"
+  name: gridinit
+
+- src: https://github.com/open-io/ansible-role-openio-repository.git
+  version: "18.10"
+  name: repo
+...

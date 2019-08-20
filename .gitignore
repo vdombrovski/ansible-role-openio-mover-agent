@@ -1,0 +1,8 @@
+# .gitignore
+
+# Backup files (e.g. Vim, Gedit, etc.)
+*~
+
+# Compiled Python
+*.pyc
+

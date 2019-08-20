@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+---
+host: {{ openio_mover_agent_bind_address }}
+port: {{ openio_mover_agent_bind_port }}
+type: {{ openio_mover_agent_type }}
+{% if openio_mover_agent_location | ipaddr %}
+location: {{ openio_mover_agent_location | replace(".", "-") }}
+{% else %}
+location: {{ openio_mover_agent_location }}
+{% endif %}
+checks:
+  - {type: tcp}
+stats: []
+slots:
+  {{ openio_mover_agent_slots | to_nice_yaml | indent(2) }}
+...

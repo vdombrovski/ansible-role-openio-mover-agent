@@ -1,0 +1,10 @@
+# {{ ansible_managed }}
+[Service.{{ openio_mover_agent_namespace }}-{{ openio_mover_agent_servicename }}]
+command=/usr/bin/oio-mover-agent --namespace {{ openio_mover_agent_namespace }} --host {{ ansible_hostname }} --addr {{ openio_mover_agent_bind_address }}:{{ openio_mover_agent_bind_port }} --log-level INFO --log-syslog-prefix OIO,{{ openio_mover_agent_namespace }},oio-mover-agent,{{ openio_mover_agent_serviceid }} --log-facility local0
+enabled=true
+start_at_boot=true
+on_die=respawn
+group={{ openio_mover_agent_namespace }},oio-mover-agent,{{ openio_mover_agent_serviceid }}
+uid=openio
+gid=openio
+env.PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin

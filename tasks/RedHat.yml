@@ -1,0 +1,35 @@
+---
+- name: Install packages
+  package:
+    name:
+      - openio-sds-server
+      - openio-sds-tools
+    state: present
+  loop_control:
+    loop_var: pkg
+  ignore_errors: "{{ ansible_check_mode }}"
+  register: install_packages
+  until: install_packages is success
+  retries: 5
+  delay: 2
+  tags: install
+
+# TODO: install via package
+- name: Install mover agent
+  copy:
+    src: "oio-mover-agent.py"
+    dest: /usr/bin/oio-mover-agent
+    mode: '0755'
+    owner: openio
+    group: openio
+  tags: install
+
+- name: Install mover agent CLI
+  copy:
+    src: "oio-mover-client"
+    dest: /usr/bin/oio-mover-client
+    mode: '0755'
+    owner: openio
+    group: openio
+  tags: install
+...
