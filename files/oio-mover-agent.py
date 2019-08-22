@@ -22,7 +22,10 @@ import cgi
 import os
 import time
 import argparse
+import signal
 import multiprocessing as mp
+import re
+import sys
 from traceback import format_exc
 
 from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
@@ -37,6 +40,11 @@ try:
 except ImportError:
     from oio.directory.meta1 import Meta1RefMapping
     legacy_meta2 = True
+
+UUID4_RE = "".join((
+    r'([0-9a-f]{8}\-[0-9a-f]{4}\-4[0-9a-f]{3}',
+    r'\-[89ab][0-9a-f]{3}\-[0-9a-f]{12})'
+))
 
 
 class BlobStatsLogger(object):
@@ -106,7 +114,38 @@ class OioMoverAgent(object):
         self.log = get_logger_from_args(args)
         self.jobs = dict()
 
-    def move_meta2_wrapper(self, src, base):
+        signal.signal(signal.SIGTERM, self._clean_exit)
+        signal.signal(signal.SIGTERM, self._clean_exit)
+
+    def _clean_exit(self, signum, frame):
+        for job in self.jobs.values():
+            self._clean_stop(job)
+        sys.exit(0)
+
+    def _clean_stop(self, job):
+        if job.get('type') == 'meta2':
+            job['control'].get('signal').value = True
+            for p in job['processes']:
+                try:
+                    p.join()
+                except AssertionError:
+                    pass
+
+        elif job.get('type') == 'rawx':
+            for p in job['processes']:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+    def _terminate(self, job):
+        for p in job['processes']:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    def _meta2_mover_wrapper(self, src, base):
         """
             Wrapper for SDS 4.x/5.x compat
         """
@@ -122,27 +161,53 @@ class OioMoverAgent(object):
                 return False
         return True
 
-    def move_meta2(self, src, bases, stats, end):
+    def move_meta2(self, config, stats, control):
         """
         Job for meta2 mover
+        In:
+        - config
+        - stats
+        - control
         """
-        self.client.lock_score(dict(type="meta2", addr=src))
-        for base in bases:
-            try:
-                if self.move_meta2_wrapper(src, base[0]):
-                    stats.get("success").value += 1
-                    stats.get("bytes").value += base[1]
-                else:
-                    stats.get("fail").value += 1
-            except Exception:
-                stats.get("fail").value += 1
-        self.client.unlock_score(dict(type="meta2", addr=src))
-        end.value = int(time.time())
+        def _set(lock_, field, value):
+            lock_.acquire()
+            field.value = value
+            lock_.release()
 
-    def move_blobs(self, src, config, stats, end):
+        def _add(lock_, field, value):
+            lock_.acquire()
+            field.value += value
+            lock_.release()
+
+        lock = control.get('lock')
+        src = config.get('src')
+        self.client.lock_score(dict(type="meta2", addr=src))
+        for base in config.get('bases'):
+            if control.get('signal').value:
+                break
+            try:
+                if self._meta2_mover_wrapper(src, base[0]):
+                    _add(lock, stats.get("success"), 1)
+                    _add(lock, stats.get("bytes"), 1)
+                else:
+                    _add(lock, stats.get("fail"), 1)
+            except Exception:
+                _add(lock, stats.get("fail"), 1)
+        if control.get('do_unlock'):
+            self.client.unlock_score(dict(type="meta2", addr=src))
+        _set(lock, control.get('status'), 2)
+        _set(lock, control.get('end'), int(time.time()))
+
+    def move_blobs(self, config, stats, control):
         """
         Job for blob mover
+        In:
+        - config
+        - stats
+        - control
         """
+        src = config.get('src')
+        del config['src']
         self.client.lock_score(dict(type="rawx", addr=src))
 
         self.log.info("Starting blob mover on %s with config %s",
@@ -158,15 +223,16 @@ class OioMoverAgent(object):
         except Exception as e:
             self.log.error("Blob mover failed with error: %s" % format_exc(e))
         self.client.unlock_score(dict(type="rawx", addr=src))
-        end.value = int(time.time())
+        control.get('status').value = 2
+        control.get('end').value = int(time.time())
 
     def check_running(self, vol):
         """
         Check if a mover job is already running on the specified volume
         """
         for _, job in self.jobs.items():
-            if job.get("host") == self.host and job.get("volume") == vol\
-                    and job.get("end").value == 0:
+            if job.get("host") == self.host and job['config'].get("volume") == vol\
+                    and job['control'].get("end").value == 0:
                 return True
 
     def volume(self, type_, src):
@@ -186,11 +252,26 @@ class OioMoverAgent(object):
         """
         to_exclude = []
         services = self.client.all_services(type_)
-        for svc in services:
-            for excl in exclude:
-                if excl in svc.get("tags", {}).get("tag.loc", []):
-                    to_exclude.append(svc.get("addr"))
-        return to_exclude
+
+        for excl in exclude:
+            incl_ = False
+            if excl.startswith("re:"):
+                excl = excl.split("re:", 1)[1]
+                if excl.startswith("!"):
+                    # Include instead of exclude
+                    incl_ = True
+                    excl = excl[1:]
+                loc = re.compile(excl)
+                for svc in services:
+                    tags_loc = svc.get("tags", {}).get("tag.loc", "")
+                    if (incl_ ^ bool(loc.match(tags_loc))):
+                        to_exclude.append(svc.get("addr"))
+            else:
+                for svc in services:
+                    for excl in exclude:
+                        if excl in svc.get("tags", {}).get("tag.loc", []):
+                            to_exclude.append(svc.get("addr"))
+            return to_exclude
 
     def fetch_jobs(self):
         """
@@ -202,12 +283,13 @@ class OioMoverAgent(object):
                 id=str(id),
                 config=job["config"],
                 stats=dict(),
-                service=job["service"],
-                volume=job["volume"],
+                service=job["config"]["src"],
+                volume=job["config"]["volume"],
                 host=job["host"],
                 type=job["type"],
-                start=job["start"],
-                end=job["end"].value
+                start=job["control"]["start"],
+                end=job["control"]["end"].value,
+                status=job["control"]["status"].value
             )
             for k, v in job["stats"].items():
                 if k == 'total' and v == 0:
@@ -222,6 +304,12 @@ class OioMoverAgent(object):
             res.append(data)
         return res
 
+    def chunk_bases(self, bases, into=1):
+        chunks = [bases[i::into] for i in range(into)]
+        for i, c in enumerate(chunks):
+            chunks[i] = [(k, v) for k, v in dict(c).iteritems()]
+        return chunks
+
     def run_job(self, type_, src, vol, opts):
         """
         Create a mover job on the specified service
@@ -231,13 +319,16 @@ class OioMoverAgent(object):
             type=type_,
             action="move",
             host=self.host,
-            volume=vol,
-            service=src,
-            process=None,
-            config=dict(),
+            processes=[],
             stats=dict(),
-            start=int(time.time()),
-            end=mp.Value('i')
+            control=dict(
+                status=mp.Value('i'),
+                signal=mp.Value('b'),
+                do_unlock=True,
+                start=int(time.time()),
+                end=mp.Value('i'),
+                lock=mp.Lock(),
+            ),
         )
 
         if type_ == "meta2":
@@ -251,23 +342,40 @@ class OioMoverAgent(object):
                         continue
                     bases.append([file.split('.1.meta2')[0], size])
 
-            job['config'] = dict(src=src)
-            for field in ("min_base_size", "max_base_size"):
+            job['config'] = dict(src=src, volume=vol, namespace=self.namespace,)
+            for field in ("min_base_size", "max_base_size", "concurrency"):
                 if opts.get(field):
                     job['config'][field] = opts.get(field)
+
+            bases_all = self.chunk_bases(bases, int(
+                job['config'].get('concurrency', '1')))
             job['stats'] = dict(
                 success=mp.Value('i'),
                 fail=mp.Value('i'),
                 bytes=mp.Value('i'),
                 total=len(bases)
             )
-            job["process"] = mp.Process(target=self.move_meta2, args=(
-                src, bases, job["stats"], job["end"]))
+
+            for bases in bases_all:
+                job["config"]["bases"] = bases
+                job["processes"].append(mp.Process(
+                    target=self.move_meta2,
+                    args=(
+                        job["config"],
+                        job["stats"],
+                        job["control"],
+                    )
+                ))
 
         elif type_ == "rawx":
-            excluded = self.excluded("rawx", opts.get('exclude', []))
+            try:
+                excluded = self.excluded("rawx", opts.get('exclude', []))
+            except Exception as e:
+                err = "Could not parse exclusion list: %s" % format_exc(e)
+                return None, err
 
             job['config'] = dict(
+                src=src,
                 volume=vol,
                 namespace=self.namespace,
             )
@@ -288,20 +396,19 @@ class OioMoverAgent(object):
                 bytes=mp.Value('i'),
                 total=0
             )
-
-            job["process"] = mp.Process(
+            job["processes"].append(mp.Process(
                 target=self.move_blobs,
                 args=(
-                    job['service'],
                     job['config'],
                     job["stats"],
-                    job["end"],
+                    job["control"]
                 )
-            )
+            ))
 
-        job['process'].start()
+        for p in job['processes']:
+            p.start()
         self.jobs[id] = job
-        return id
+        return id, None
 
 
 def make_handler(options):
@@ -369,11 +476,43 @@ def make_handler(options):
             if self.agent.check_running(vol):
                 return self.http(
                     400,
-                    err="A job is already running on the target volume"
+                    err="A job is already running on the target volume",
                 )
 
-            id = self.agent.run_job(type_, src, vol, req)
+            id, err = self.agent.run_job(type_, src, vol, req)
+            if err:
+                self.http(400, err=err)
             self.http(201, json_=dict(id=id))
+
+        def do_DELETE(self):
+            """
+                Stop execution of a job
+            """
+            route = re.compile(r'^/api/v1/jobs/%s$' % UUID4_RE, re.I)
+            match = route.match(self.path)
+            if not match:
+                return self.http(404, err="Invalid URI")
+            job_id = match.group(1)
+            job = self.agent.jobs.get(job_id)
+            if not job:
+                return self.http(404, err="No such job %s" % job_id)
+
+            if job.get('type') == 'meta2':
+                job['control'].get('signal').value = True
+                for p in job['processes']:
+                    p.join()
+
+            elif job.get('type') == 'rawx':
+                for p in job['processes']:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+            if job['control']['status'].value == 0:
+                with job['control'].get('lock'):
+                    job['control']['status'].value = 1
+                    job['control']['end'].value = int(time.time())
+            return self.http(204)
 
     return OioMoverAgentHandler
 
