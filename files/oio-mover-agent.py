@@ -112,14 +112,20 @@ class OioMoverAgent(object):
         self.namespace = args.namespace
         self.client = self.cm.conscience({"namespace": args.namespace})
         self.log = get_logger_from_args(args)
+        self.log.info("Starting oio-mover-agent")
         self.jobs = dict()
 
         signal.signal(signal.SIGTERM, self._clean_exit)
         signal.signal(signal.SIGTERM, self._clean_exit)
 
     def _clean_exit(self, signum, frame):
+        self.log.info(
+            "Clean exit requested: cleaning %d running jobs",
+            len([j for j in self.jobs.values() if j.get('status') == 0])
+        )
         for job in self.jobs.values():
             self._clean_stop(job)
+        self.log.info("Job cleanup completed. Shutting down")
         sys.exit(0)
 
     def _clean_stop(self, job):
@@ -184,7 +190,7 @@ class OioMoverAgent(object):
         self.client.lock_score(dict(type="meta2", addr=src))
         for base in config.get('bases'):
             if control.get('signal').value:
-                break
+                return
             try:
                 if self._meta2_mover_wrapper(src, base[0]):
                     _add(lock, stats.get("success"), 1)
