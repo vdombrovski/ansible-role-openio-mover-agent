@@ -1,18 +1,4 @@
 #!/usr/bin/env python
-# Copyright (C) 2019 OpenIO SAS, as part of OpenIO SDS
-#
-# This library is free software; you can redistribute it and/or
-# modify it under the terms of the GNU Lesser General Public
-# License as published by the Free Software Foundation; either
-# version 3.0 of the License, or (at your option) any later version.
-#
-# This library is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-# Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public
-# License along with this library.
 
 from __future__ import print_function
 
@@ -27,12 +13,17 @@ import multiprocessing as mp
 import re
 import sys
 from traceback import format_exc
+from random import shuffle
+from urllib import unquote
+import requests
 
 from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 
 from oio.blob.mover import BlobMoverWorker
 from oio.conscience.client import ConscienceClient
+from oio.api.object_storage import ObjectStorageApi
 from oio.cli import make_logger_args_parser, get_logger_from_args
+from oio.rdir.client import RdirClient
 
 legacy_meta2 = False
 try:
@@ -160,7 +151,7 @@ class OioMoverAgent(object):
             moved = mapping.move(src, None, base, "meta2")
             return mapping.apply(moved, src_service=src)
 
-        meta2 = self.cmd.meta2_mover({'namespace': self.namespace})
+        meta2 = self.cm.meta2_mover({'namespace': self.namespace})
         moved = meta2.move(base, src)
         for res in moved:
             if res['err']:
@@ -204,6 +195,61 @@ class OioMoverAgent(object):
         _set(lock, control.get('status'), 2)
         _set(lock, control.get('end'), int(time.time()))
 
+    def tier_content(self, config, stats, control):
+        def _set(lock_, field, value):
+            lock_.acquire()
+            field.value = value
+            lock_.release()
+
+        def _add(lock_, field, value):
+            lock_.acquire()
+            field.value += value
+            lock_.release()
+        lock = control.get('lock')
+        try:
+            src = config.get('src')
+            del config['src']
+            self.client.lock_score(dict(type="rawx", addr=src))
+            api = ObjectStorageApi(config["namespace"])
+            rdir_client = RdirClient({'namespace': config["namespace"]})
+
+            self.log.info("Starting tierer on %s with policy %s" % (src, config["policy"]))
+
+            policies = dict()
+            for part in config["policy"].split(','):
+                policies[part.split(':')[0]] = part.split(':')[1]
+                self.log.info("Parsed policy: " + part.split(':')[0] + " " + part.split(':')[1])
+
+            for marker in config["markers"]:
+                req = dict(
+                    start_after=marker,
+                    limit=1000,
+                )
+                _, resp_body = rdir_client._rdir_request(src, 'POST', 'fetch', json=req)
+                for (key, value) in resp_body:
+                    _, _, chunk = key.split('|')
+                    res = requests.head("http://" + src + "/" + chunk)
+                    policy = res.headers.get("x-oio-chunk-meta-content-storage-policy", "")
+                    if policy not in policies.keys():
+                        _add(lock, stats.get("skip"), 1)
+                        continue
+                    path = res.headers.get("x-oio-chunk-meta-full-path", "///")
+                    path_parts = path.split('/')
+                    if len(path_parts) < 3:
+                        _add(lock, stats.get("skip"), 1)
+                        continue
+                    try:
+                        api.object_change_policy(unquote(path_parts[0]), unquote(path_parts[1]), unquote(path_parts[2]), policies[policy])
+                        _add(lock, stats.get("success"), 1)
+                    except Exception as e:
+                        self.log.info("Operation failed %s: %s (%s)" % (path, format_exc(e), policies[policy]))
+                        _add(lock, stats.get("fail"), 1)
+        except Exception as e:
+            self.log.error("Tierer failed with %s" % format_exc(e))
+        _set(lock, control.get('status'), 2)
+        _set(lock, control.get('end'), int(time.time()))
+
+
     def move_blobs(self, config, stats, control):
         """
         Job for blob mover
@@ -228,17 +274,17 @@ class OioMoverAgent(object):
             worker.mover_pass()
         except Exception as e:
             self.log.error("Blob mover failed with error: %s" % format_exc(e))
-        self.client.unlock_score(dict(type="rawx", addr=src))
+        # self.client.unlock_score(dict(type="rawx", addr=src))
         control.get('status').value = 2
         control.get('end').value = int(time.time())
 
-    def check_running(self, vol):
+    def check_running(self, vol, src):
         """
         Check if a mover job is already running on the specified volume
         """
         for _, job in self.jobs.items():
             if job.get("host") == self.host and job['config'].get("volume") == vol\
-                    and job['control'].get("end").value == 0:
+                    and job['control'].get("end").value == 0 and job['config'].get('src', None) == src:
                 return True
 
     def volume(self, type_, src):
@@ -279,7 +325,7 @@ class OioMoverAgent(object):
                             to_exclude.append(svc.get("addr"))
             return to_exclude
 
-    def fetch_jobs(self):
+    def fetch_jobs(self, full=False):
         """
         Get the status/stats of all running jobs
         """
@@ -287,7 +333,7 @@ class OioMoverAgent(object):
         for id, job in self.jobs.items():
             data = dict(
                 id=str(id),
-                config=job["config"],
+                config=job["config"] if full else dict(),
                 stats=dict(),
                 service=job["config"]["src"],
                 volume=job["config"]["volume"],
@@ -330,7 +376,7 @@ class OioMoverAgent(object):
             control=dict(
                 status=mp.Value('i'),
                 signal=mp.Value('b'),
-                do_unlock=True,
+                do_unlock=(type_ == "rawx"),
                 start=int(time.time()),
                 end=mp.Value('i'),
                 lock=mp.Lock(),
@@ -353,14 +399,22 @@ class OioMoverAgent(object):
                 if opts.get(field):
                     job['config'][field] = opts.get(field)
 
+            target = opts.get("target", 0)
+            if target > 0:
+                to_move = int(target * len(bases) / 100)
+                bases = bases[:to_move]
+
             bases_all = self.chunk_bases(bases, int(
                 job['config'].get('concurrency', '1')))
+
             job['stats'] = dict(
                 success=mp.Value('i'),
                 fail=mp.Value('i'),
                 bytes=mp.Value('i'),
                 total=len(bases)
             )
+            if opts.get("shuffle", False):
+                shuffle(bases_all)
 
             for bases in bases_all:
                 job["config"]["bases"] = bases
@@ -372,7 +426,33 @@ class OioMoverAgent(object):
                         job["control"],
                     )
                 ))
-
+        # Tiering request
+        elif type_ == "rawx" and opts.get("policy", None):
+            job['config'] = dict(
+                src=src,
+                namespace=self.namespace,
+                markers=[],
+                volume=vol,
+                policy=opts.get("policy"),
+            )
+            into = int(job['config'].get('concurrency', '1'))
+            markers_all = [opts.get("markers")[i::into] for i in range(into)]
+            job['stats'] = dict(
+                success=mp.Value('i'),
+                fail=mp.Value('i'),
+                skip=mp.Value('i'),
+                total=int(opts.get("total")), # Approx value but still it's good enough
+            )
+            for markers in markers_all:
+                job['config']['markers'] = markers
+                job["processes"].append(mp.Process(
+                    target=self.tier_content,
+                    args=(
+                        job['config'],
+                        job["stats"],
+                        job["control"],
+                    )
+                ))
         elif type_ == "rawx":
             try:
                 excluded = self.excluded("rawx", opts.get('exclude', []))
@@ -390,7 +470,9 @@ class OioMoverAgent(object):
                           ("concurrency", "concurrency"),
                           ("target", "usage_target"),
                           ("minsize", "min_chunk_size"),
-                          ("maxsize", "max_chunk_size")]:
+                          ("maxsize", "max_chunk_size"),
+                          ("minversion", "min_version"),
+                          ("maxversion", "max_version")]:
                 if opts.get(field[0]):
                     job["config"][field[1]] = opts[field[0]]
             if excluded:
@@ -415,7 +497,6 @@ class OioMoverAgent(object):
             p.start()
         self.jobs[id] = job
         return id, None
-
 
 def make_handler(options):
     """
@@ -447,7 +528,9 @@ def make_handler(options):
             """
             if not self.path.startswith("/api/v1/jobs"):
                 return self.http(404, err="Invalid URI")
-            self.http(200, json_=self.agent.fetch_jobs())
+            self.http(200, json_=self.agent.fetch_jobs(
+                self.path == "/api/v1/jobs?full=true"
+            ))
 
         def do_POST(self):
             """
@@ -476,10 +559,13 @@ def make_handler(options):
                 return self.http(400, err="Invalid service")
 
             vol = self.agent.volume(type_, src)
+            # When tiering, the volume needs to be provided by client
+            if req.get("policy"):
+                vol = req.get('vol')
             if not vol:
                 return self.http(400, err="Volume not found")
 
-            if self.agent.check_running(vol):
+            if self.agent.check_running(vol, src):
                 return self.http(
                     400,
                     err="A job is already running on the target volume",
